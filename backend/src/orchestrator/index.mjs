@@ -112,15 +112,26 @@ const checkAcademicProgress = tool({
     selected_courses: z.array(z.object({
       course_name: z.string(),
       credits: z.number(),
-    })).describe("Courses the student plans to take this semester"),
+    })).optional().describe("Courses the student plans to take this semester"),
   }),
-  callback: async ({ student_id, selected_courses }) => {
-    const courseProgress = await loadStudentProgress(student_id);
-    const completed = Object.values(courseProgress).filter(p => p.estado === "aprobada");
-    const result = calculateProgress(
-      completed,
-      selected_courses.map(c => ({ courseName: c.course_name, credits: c.credits })),
-    );
+  callback: async ({ student_id, selected_courses = [] }) => {
+    const [courseProgress, catalogItems] = await Promise.all([
+      loadStudentProgress(student_id),
+      ddb.send(new ScanCommand({
+        TableName: CATALOG_TABLE,
+        FilterExpression: "begins_with(id, :prefix)",
+        ExpressionAttributeValues: { ":prefix": "unam#course#" },
+      })).then(r => r.Items ?? []),
+    ]);
+    const creditMap = Object.fromEntries(catalogItems.map(c => [c.clave, c.creditos ?? 0]));
+    const completed = Object.values(courseProgress)
+      .filter(p => p.estado === "aprobada")
+      .map(p => ({ credits: creditMap[p.clave] ?? p.creditos ?? 0, courseName: p.clave }));
+    const inProgress = Object.values(courseProgress)
+      .filter(p => p.estado === "en_curso" || p.estado === "recursando")
+      .map(p => ({ credits: creditMap[p.clave] ?? 0, courseName: p.clave }));
+    const planned = selected_courses.map(c => ({ courseName: c.course_name, credits: c.credits }));
+    const result = calculateProgress(completed, [...inProgress, ...planned]);
     return JSON.stringify(result);
   },
 });

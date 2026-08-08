@@ -1,0 +1,14 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "unam-student-agent"
+resolve_s3 = true
+capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
+confirm_changeset = false
+region = "us-east-1"
+
+[default.build.parameters]
+template = "infrastructure/template.yaml"
+
+[default.deploy.parameters]
+template = "infrastructure/template.yaml"

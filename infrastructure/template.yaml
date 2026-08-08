@@ -11,105 +11,15 @@ Globals:
     PermissionsBoundary: arn:aws:iam::210373500643:policy/hackathon-boundary
     Environment:
       Variables:
-        STUDENTS_TABLE: !Ref StudentsTable
-        COURSES_TABLE: !Ref CoursesTable
-        PROFESSORS_TABLE: !Ref ProfessorsTable
-        ROADMAPS_TABLE: !Ref RoadmapsTable
-        SESSIONS_TABLE: !Ref SessionsTable
+        STUDENTS_TABLE: unam-students
+        COURSES_TABLE: unam-courses
+        PROFESSORS_TABLE: unam-professors
+        ROADMAPS_TABLE: unam-roadmaps
+        SESSIONS_TABLE: unam-sessions
         RAG_BUCKET: !Ref RagCorpusBucket
         REGION: !Ref AWS::Region
 
 Resources:
-
-  # ── DynamoDB Tables ────────────────────────────────────────────────────────
-
-  StudentsTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: unam-students
-      BillingMode: PAY_PER_REQUEST
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
-      AttributeDefinitions:
-        - { AttributeName: PK, AttributeType: S }
-        - { AttributeName: SK, AttributeType: S }
-        - { AttributeName: careerGoal, AttributeType: S }
-      KeySchema:
-        - { AttributeName: PK, KeyType: HASH }
-        - { AttributeName: SK, KeyType: RANGE }
-      GlobalSecondaryIndexes:
-        - IndexName: careerGoal-PK-index
-          KeySchema:
-            - { AttributeName: careerGoal, KeyType: HASH }
-            - { AttributeName: PK, KeyType: RANGE }
-          Projection: { ProjectionType: ALL }
-
-  CoursesTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: unam-courses
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - { AttributeName: PK, AttributeType: S }
-        - { AttributeName: SK, AttributeType: S }
-        - { AttributeName: professorId, AttributeType: S }
-        - { AttributeName: semester, AttributeType: S }
-      KeySchema:
-        - { AttributeName: PK, KeyType: HASH }
-        - { AttributeName: SK, KeyType: RANGE }
-      GlobalSecondaryIndexes:
-        - IndexName: professor-courses-index
-          KeySchema:
-            - { AttributeName: professorId, KeyType: HASH }
-            - { AttributeName: SK, KeyType: RANGE }
-          Projection: { ProjectionType: ALL }
-        - IndexName: semester-index
-          KeySchema:
-            - { AttributeName: semester, KeyType: HASH }
-            - { AttributeName: PK, KeyType: RANGE }
-          Projection: { ProjectionType: ALL }
-
-  ProfessorsTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: unam-professors
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - { AttributeName: PK, AttributeType: S }
-        - { AttributeName: SK, AttributeType: S }
-      KeySchema:
-        - { AttributeName: PK, KeyType: HASH }
-        - { AttributeName: SK, KeyType: RANGE }
-      TimeToLiveSpecification:
-        AttributeName: ttl
-        Enabled: true
-
-  RoadmapsTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: unam-roadmaps
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - { AttributeName: PK, AttributeType: S }
-        - { AttributeName: SK, AttributeType: S }
-      KeySchema:
-        - { AttributeName: PK, KeyType: HASH }
-        - { AttributeName: SK, KeyType: RANGE }
-
-  SessionsTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: unam-sessions
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - { AttributeName: PK, AttributeType: S }
-        - { AttributeName: SK, AttributeType: S }
-      KeySchema:
-        - { AttributeName: PK, KeyType: HASH }
-        - { AttributeName: SK, KeyType: RANGE }
-      TimeToLiveSpecification:
-        AttributeName: ttl
-        Enabled: true
 
   # ── S3 Bucket ──────────────────────────────────────────────────────────────
 
@@ -132,6 +42,12 @@ Resources:
 
   # ── SQS Queues ─────────────────────────────────────────────────────────────
 
+  ScrapingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: unam-scraping-dlq
+      MessageRetentionPeriod: 604800
+
   ScrapingQueue:
     Type: AWS::SQS::Queue
     Properties:
@@ -141,12 +57,6 @@ Resources:
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt ScrapingDLQ.Arn
         maxReceiveCount: 3
-
-  ScrapingDLQ:
-    Type: AWS::SQS::Queue
-    Properties:
-      QueueName: unam-scraping-dlq
-      MessageRetentionPeriod: 604800
 
   NotificationQueue:
     Type: AWS::SQS::Queue
@@ -173,11 +83,11 @@ Resources:
       Handler: index.handler
       CodeUri: ../backend/src/orchestrator/
       Policies:
-        - DynamoDBCrudPolicy: { TableName: !Ref StudentsTable }
-        - DynamoDBCrudPolicy: { TableName: !Ref CoursesTable }
-        - DynamoDBCrudPolicy: { TableName: !Ref ProfessorsTable }
-        - DynamoDBCrudPolicy: { TableName: !Ref RoadmapsTable }
-        - DynamoDBCrudPolicy: { TableName: !Ref SessionsTable }
+        - DynamoDBCrudPolicy: { TableName: unam-students }
+        - DynamoDBCrudPolicy: { TableName: unam-courses }
+        - DynamoDBCrudPolicy: { TableName: unam-professors }
+        - DynamoDBCrudPolicy: { TableName: unam-roadmaps }
+        - DynamoDBCrudPolicy: { TableName: unam-sessions }
         - S3ReadPolicy: { BucketName: !Ref RagCorpusBucket }
         - Statement:
             - Effect: Allow
@@ -193,8 +103,8 @@ Resources:
       Timeout: 300
       MemorySize: 512
       Policies:
-        - DynamoDBCrudPolicy: { TableName: !Ref CoursesTable }
-        - DynamoDBCrudPolicy: { TableName: !Ref ProfessorsTable }
+        - DynamoDBCrudPolicy: { TableName: unam-courses }
+        - DynamoDBCrudPolicy: { TableName: unam-professors }
         - S3CrudPolicy: { BucketName: !Ref RagCorpusBucket }
         - SQSPollerPolicy: { QueueName: !GetAtt ScrapingQueue.QueueName }
       Events:
@@ -233,6 +143,20 @@ Resources:
       ParentId: !GetAtt Api.RootResourceId
       PathPart: chat
 
+  RootMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !GetAtt Api.RootResourceId
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        ResponseTransferMode: STREAM
+        TimeoutInMillis: 29000
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2021-11-15/functions/${OrchestratorFunction.Arn}/response-streaming-invocations
+
   ChatMethod:
     Type: AWS::ApiGateway::Method
     Properties:
@@ -249,7 +173,7 @@ Resources:
 
   Deployment:
     Type: AWS::ApiGateway::Deployment
-    DependsOn: [ChatMethod]
+    DependsOn: [RootMethod, ChatMethod]
     Properties:
       RestApiId: !Ref Api
 
@@ -264,7 +188,7 @@ Resources:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !GetAtt OrchestratorFunction.Arn
-      Action: lambda:InvokeFunction
+      Action: lambda:InvokeWithResponseStream
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*
 
@@ -288,10 +212,6 @@ Resources:
 Outputs:
   ApiUrl:
     Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/prod/"
-  StudentsTable:
-    Value: !Ref StudentsTable
-  CoursesTable:
-    Value: !Ref CoursesTable
   RagBucket:
     Value: !Ref RagCorpusBucket
   ScrapingQueue:

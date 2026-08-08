@@ -1,3 +1,4 @@
+import { CHAT_HTML } from "./chat-page.mjs";
 import { Agent, BedrockModel, tool } from "@strands-agents/sdk";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
@@ -216,6 +217,17 @@ IMPORTANT RULES:
 // ── Lambda handler ───────────────────────────────────────────────────────────
 
 export const handler = awslambda.streamifyResponse(async (event, responseStream) => {
+  // GET / → serve the chat UI
+  if (event.httpMethod === "GET") {
+    responseStream = awslambda.HttpResponseStream.from(responseStream, {
+      statusCode: 200,
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+    });
+    responseStream.write(CHAT_HTML);
+    responseStream.end();
+    return;
+  }
+
   const body = JSON.parse(event.body ?? "{}");
   const message = body.message ?? "";
   const sessionId = body.sessionId ?? "default";

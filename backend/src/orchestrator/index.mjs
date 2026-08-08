@@ -189,6 +189,79 @@ const rankStudyTool = tool({
   },
 });
 
+const listLanguages = tool({
+  name: "list_languages",
+  description:
+    "List all language courses offered by ENALLT (UNAM) this semester, including available levels.",
+  inputSchema: z.object({
+    semester: z.string().describe("e.g. '2026-2'").optional(),
+  }),
+  callback: async ({ semester = "2026-2" }) => {
+    const resp = await ddb.send(new ScanCommand({
+      TableName: CATALOG_TABLE,
+      FilterExpression: "begins_with(id, :prefix)",
+      ExpressionAttributeValues: { ":prefix": `unam#lang#meta#` },
+    }));
+    if (!resp.Items?.length) return "No hay datos de idiomas ENALLT en el catálogo.";
+    return JSON.stringify(resp.Items.map(l => ({
+      language: l.nombre,
+      key: l.langKey,
+      levels: l.levels,
+      institution: "ENALLT-UNAM",
+    })));
+  },
+});
+
+const findLanguageGaps = tool({
+  name: "find_language_gaps",
+  description:
+    "Given a student's occupied schedule slots, find ENALLT language groups that fit without overlap. " +
+    "Never check overlaps yourself — use this tool.",
+  inputSchema: z.object({
+    occupied_slots: z.array(z.object({
+      day: z.string().describe("e.g. 'Lunes'"),
+      start: z.string().describe("HH:MM"),
+      end: z.string().describe("HH:MM"),
+    })),
+    semester: z.string().describe("e.g. '2026-2'"),
+    language_key: z.string().optional().describe("Filter by language, e.g. 'ingles'"),
+    level: z.string().optional().describe("Filter by level, e.g. 'A1'"),
+  }),
+  callback: async ({ occupied_slots, semester, language_key, level }) => {
+    const toMins = t => { const [h, m] = t.split(":").map(Number); return h * 60 + m; };
+    const overlaps = (a, b) =>
+      a.day === b.day &&
+      toMins(a.start) < toMins(b.end) &&
+      toMins(b.start) < toMins(a.end);
+    const groupFits = g => !g.schedule.some(ls => occupied_slots.some(bs => overlaps(ls, bs)));
+
+    const resp = await ddb.send(new ScanCommand({
+      TableName: CATALOG_TABLE,
+      FilterExpression: "begins_with(id, :prefix)",
+      ExpressionAttributeValues: { ":prefix": `unam#lang#group#${semester}` },
+    }));
+    let items = resp.Items ?? [];
+    if (language_key) items = items.filter(i => i.langKey === language_key);
+    if (level) items = items.filter(i => i.level === level);
+
+    const fitting = items.filter(groupFits);
+    if (!fitting.length) {
+      return "Ningún grupo de idiomas ENALLT cabe en los huecos libres. Considera grupos sabatinos o vespertinos.";
+    }
+
+    const grouped = {};
+    for (const g of fitting) {
+      const key = `${g.langKey}-${g.level}`;
+      (grouped[key] ??= { language: g.langKey, level: g.level, groups: [] }).groups.push({
+        groupId: g.groupId,
+        schedule: g.schedule,
+        spotsLeft: (g.quota ?? 30) - (g.enrolled ?? 0),
+      });
+    }
+    return JSON.stringify({ semester, fitting_groups_found: fitting.length, by_language: Object.values(grouped) });
+  },
+});
+
 // ── System prompt ─────────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `Eres un asistente académico personal para estudiantes de la UNAM Facultad de Ciencias (Ciencias de la Computación).
@@ -206,7 +279,8 @@ REGLAS IMPORTANTES:
 6. Si no tienes datos reales (herramienta sin resultados), dilo claramente.
 7. Sé cálido, útil y conciso. Los estudiantes están ocupados.
 8. Responde en español a menos que el estudiante escriba en inglés.
-9. Para identificar al estudiante puedes pedirle su número de cuenta UNAM.`;
+9. Para identificar al estudiante puedes pedirle su número de cuenta UNAM.
+10. Cuando el estudiante pregunte sobre cursos de idiomas o ENALLT, primero usa list_languages para mostrar opciones, luego find_language_gaps con sus slots ocupados para ver cuáles caben en su horario.`;
 
 // ── Lambda handler ─────────────────────────────────────────────────────────────
 
@@ -244,6 +318,8 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
       saveProfessorMemory,
       updateAcademicProgress,
       updateCourseGrades,
+      listLanguages,
+      findLanguageGaps,
     ],
     printer: false,
   });

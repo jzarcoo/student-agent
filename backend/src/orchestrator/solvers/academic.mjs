@@ -1,66 +1,61 @@
-import { QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
-import { ddb } from "../db.mjs";
+import { ScanCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
+import { ddb, CATALOG_TABLE } from "../db.mjs";
+import { loadStudentProgress, loadStudentProfile } from "../session.mjs";
 
-// Load the full prerequisite graph from DynamoDB
-async function loadPrereqGraph() {
+// ── Catalog loaders (product-catalog, read-only) ──────────────────────────────
+
+async function loadCatalogItems(type) {
+  // Items in product-catalog have id = "unam#<type>#<key>"
   const resp = await ddb.send(new ScanCommand({
-    TableName: process.env.PREREQS_TABLE,
+    TableName: CATALOG_TABLE,
+    FilterExpression: "begins_with(id, :prefix)",
+    ExpressionAttributeValues: { ":prefix": `unam#${type}#` },
   }));
   return resp.Items ?? [];
 }
 
-// Load all courses
-async function loadCourses() {
-  const resp = await ddb.send(new ScanCommand({
-    TableName: process.env.COURSES_TABLE,
+async function getCatalogItem(type, key) {
+  const resp = await ddb.send(new GetCommand({
+    TableName: CATALOG_TABLE,
+    Key: { id: `unam#${type}#${key}` },
   }));
-  return resp.Items ?? [];
+  return resp.Item ?? null;
 }
 
-// Load student's academic progress
-async function loadProgress(studentId) {
-  const resp = await ddb.send(new QueryCommand({
-    TableName: process.env.PROGRESS_TABLE,
-    KeyConditionExpression: "studentId = :sid",
-    ExpressionAttributeValues: { ":sid": studentId },
-  }));
-  return resp.Items ?? [];
-}
+// ── Prerequisite check ────────────────────────────────────────────────────────
 
-// Given student history, determine status of each course
-// Returns: { clave -> { status, blockers, warnings, distanceToGrad } }
 export async function checkPrerequisites(studentId) {
-  const [edges, courses, progress] = await Promise.all([
-    loadPrereqGraph(),
-    loadCourses(),
-    loadProgress(studentId),
+  const [edges, courses, courseProgress] = await Promise.all([
+    loadCatalogItems("prereq"),
+    loadCatalogItems("course"),
+    loadStudentProgress(studentId),
   ]);
 
   const aprobadas = new Set(
-    progress.filter(p => p.estado === "aprobada").map(p => p.clave)
+    Object.values(courseProgress).filter(p => p.estado === "aprobada").map(p => p.clave)
   );
   const enCurso = new Set(
-    progress.filter(p => p.estado === "en_curso" || p.estado === "recursando").map(p => p.clave)
+    Object.values(courseProgress).filter(p => p.estado === "en_curso" || p.estado === "recursando").map(p => p.clave)
   );
   const reprobadas = new Set(
-    progress.filter(p => p.estado === "reprobada").map(p => p.clave)
+    Object.values(courseProgress).filter(p => p.estado === "reprobada").map(p => p.clave)
   );
 
   const result = {};
 
   for (const course of courses) {
-    const { clave } = course;
+    const clave = course.clave ?? course.id.split("#")[2];
 
     if (aprobadas.has(clave)) {
-      result[clave] = { status: "aprobada", blockers: [], warnings: [] };
+      result[clave] = { status: "aprobada", nombre: course.nombre, blockers: [], warnings: [] };
       continue;
     }
     if (enCurso.has(clave)) {
-      result[clave] = { status: "en_curso", blockers: [], warnings: [] };
+      result[clave] = { status: "en_curso", nombre: course.nombre, blockers: [], warnings: [] };
       continue;
     }
 
-    const prereqs = edges.filter(e => e.clave === clave);
+    const prereqs = edges.filter(e => (e.clave ?? e.id.split("#")[2]) === clave);
     const obligatorios = prereqs.filter(e => e.tipo === "obligatorio");
     const sugeridos = prereqs.filter(e => e.tipo === "sugerido");
 
@@ -81,62 +76,61 @@ export async function checkPrerequisites(studentId) {
       status = "bloqueada";
     }
 
-    result[clave] = { status, blockers, warnings };
+    result[clave] = { status, nombre: course.nombre, creditos: course.creditos, blockers, warnings };
   }
 
   return result;
 }
 
-// Returns courses the student CAN enroll in this semester
 export async function getAvailableCourses(studentId) {
   const prereqStatus = await checkPrerequisites(studentId);
   return Object.entries(prereqStatus)
-    .filter(([, v]) => v.status === "disponible" || v.status === "disponible_con_advertencia" || v.status === "recursable")
+    .filter(([, v]) => ["disponible", "disponible_con_advertencia", "recursable"].includes(v.status))
     .map(([clave, info]) => ({ clave, ...info }));
 }
 
-// Calculate total credits obtained
+// ── Credit calculator ─────────────────────────────────────────────────────────
+
 export async function calculateCredits(studentId) {
-  const [progress, courses] = await Promise.all([
-    loadProgress(studentId),
-    loadCourses(),
+  const [courses, courseProgress] = await Promise.all([
+    loadCatalogItems("course"),
+    loadStudentProgress(studentId),
   ]);
 
-  const courseMap = Object.fromEntries(courses.map(c => [c.clave, c]));
-  const aprobadas = progress.filter(p => p.estado === "aprobada");
+  const courseMap = Object.fromEntries(
+    courses.map(c => [c.clave ?? c.id.split("#")[2], c])
+  );
+  const aprobadas = Object.values(courseProgress).filter(p => p.estado === "aprobada");
 
   const total = aprobadas.reduce((sum, p) => {
     const course = courseMap[p.clave];
     return sum + (course?.creditos ?? 0);
   }, 0);
 
+  const TOTAL_REQUIRED = 384;
   return {
     obtenidos: total,
-    requeridos: 384, // CC total credits at UNAM Ciencias
-    porcentaje: Math.round((total / 384) * 100),
-    materiasFaltantes: Object.keys(courseMap).length - aprobadas.length,
+    requeridos: TOTAL_REQUIRED,
+    porcentaje: Math.round((total / TOTAL_REQUIRED) * 100),
+    materiasAprobadas: aprobadas.length,
+    materiasTotales: courses.length,
   };
 }
 
-// Estimate graduation semester
+// ── Graduation estimate ───────────────────────────────────────────────────────
+
 export async function estimateGraduation(studentId, creditosPorSemestre = 30) {
   const { obtenidos, requeridos } = await calculateCredits(studentId);
-  const restantes = requeridos - obtenidos;
+  const restantes = Math.max(0, requeridos - obtenidos);
   const semestresRestantes = Math.ceil(restantes / creditosPorSemestre);
 
   const now = new Date();
-  const currentYear = now.getFullYear();
-  const currentSemester = now.getMonth() < 6 ? 1 : 2;
-
-  let year = currentYear;
-  let semester = currentSemester;
+  let year = now.getFullYear();
+  let semester = now.getMonth() < 6 ? 1 : 2;
 
   for (let i = 0; i < semestresRestantes; i++) {
     semester++;
-    if (semester > 2) {
-      semester = 1;
-      year++;
-    }
+    if (semester > 2) { semester = 1; year++; }
   }
 
   return {
@@ -146,12 +140,12 @@ export async function estimateGraduation(studentId, creditosPorSemestre = 30) {
   };
 }
 
-// Suggest titulación modality based on student profile
+// ── Titulación suggestion ─────────────────────────────────────────────────────
+
 export function suggestTitulacion(profile, credits) {
   const suggestions = [];
-
   if (credits.porcentaje >= 100) {
-    if (profile.promedio >= 9.0) {
+    if ((profile.promedio ?? 0) >= 9.0) {
       suggestions.push({
         modalidad: "Titulación por promedio",
         descripcion: "Tu promedio >= 9.0 te califica para titulación automática. Es la ruta más rápida.",
@@ -171,11 +165,11 @@ export function suggestTitulacion(profile, credits) {
       prioridad: 3,
     });
   }
-
   return suggestions.sort((a, b) => a.prioridad - b.prioridad);
 }
 
-// Rank study priority for current courses
+// ── Study priority ranker ─────────────────────────────────────────────────────
+
 export function rankStudyPriority(materias, calificaciones, agenda) {
   return materias.map(materia => {
     const cal = calificaciones[materia.clave] ?? {};
@@ -188,27 +182,22 @@ export function rankStudyPriority(materias, calificaciones, agenda) {
       : 30;
 
     const notaActual = cal.promedioParcial ?? 7;
-    const notaNecesaria = Math.max(0, 6 - notaActual * 0.6) / 0.4; // needed in final to pass
     const pesoFinal = materia.evaluacion?.final ?? 0.4;
-
     const urgencia =
       (1 / diasHastaEvento) * 40 +
-      Math.max(0, notaNecesaria - notaActual) * 30 +
+      Math.max(0, 6 - notaActual) * 30 +
       pesoFinal * 20 +
       (materia.dificultad ?? 5) * 10;
+
+    const parts = [];
+    if (proximoEvento && diasHastaEvento <= 3) parts.push(`${proximoEvento.titulo} en ${diasHastaEvento} día(s)`);
+    if (notaActual < 7) parts.push(`promedio actual ${notaActual.toFixed(1)}`);
 
     return {
       clave: materia.clave,
       nombre: materia.nombre,
       urgencia: Math.round(urgencia),
-      razon: buildReason(diasHastaEvento, notaActual, proximoEvento),
+      razon: parts.join(", ") || "prioridad normal",
     };
   }).sort((a, b) => b.urgencia - a.urgencia);
-}
-
-function buildReason(dias, nota, evento) {
-  const parts = [];
-  if (evento && dias <= 3) parts.push(`${evento.titulo} en ${dias} día(s)`);
-  if (nota < 7) parts.push(`promedio actual ${nota.toFixed(1)}`);
-  return parts.join(", ") || "prioridad normal";
 }

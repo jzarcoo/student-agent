@@ -8,7 +8,6 @@ Globals:
     Architectures: [arm64]
     MemorySize: 512
     Timeout: 120
-    PermissionsBoundary: arn:aws:iam::210373500643:policy/hackathon-boundary
     Environment:
       Variables:
         STUDENTS_TABLE:   !Ref StudentsTable
@@ -21,64 +20,11 @@ Globals:
         AGENDA_TABLE:     !Ref AgendaTable
         RAG_TABLE:        !Ref RagChunksTable
         SESSIONS_TABLE:   !Ref SessionsTable
-        DOCS_BUCKET:      !Ref RagCorpusBucket
+        DOCS_BUCKET:      !Sub unam-rag-corpus-${AWS::AccountId}
 
 Resources:
 
-  # ── S3 Bucket ──────────────────────────────────────────────────────────────
-
-  RagCorpusBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub unam-rag-corpus-${AWS::AccountId}
-      VersioningConfiguration:
-        Status: Enabled
-      LifecycleConfiguration:
-        Rules:
-          - Id: expire-reviews-cache
-            Status: Enabled
-            Prefix: reviews-cache/
-            ExpirationInDays: 7
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
-
-  # ── SQS Queues ─────────────────────────────────────────────────────────────
-
-  ScrapingDLQ:
-    Type: AWS::SQS::Queue
-    Properties:
-      QueueName: unam-scraping-dlq
-      MessageRetentionPeriod: 604800
-
-  ScrapingQueue:
-    Type: AWS::SQS::Queue
-    Properties:
-      QueueName: unam-scraping-queue
-      VisibilityTimeout: 300
-      MessageRetentionPeriod: 86400
-      RedrivePolicy:
-        deadLetterTargetArn: !GetAtt ScrapingDLQ.Arn
-        maxReceiveCount: 3
-
-  NotificationQueue:
-    Type: AWS::SQS::Queue
-    Properties:
-      QueueName: unam-notification-queue
-      VisibilityTimeout: 60
-
-  # ── SNS Topic ──────────────────────────────────────────────────────────────
-
-  StudentNotificationsTopic:
-    Type: AWS::SNS::Topic
-    Properties:
-      TopicName: unam-student-notifications
-      Subscription:
-        - Protocol: sqs
-          Endpoint: !GetAtt NotificationQueue.Arn
-
-  # ── Lambda Functions ───────────────────────────────────────────────────────
+  # ── Lambda — Main Agent Orchestrator ─────────────────────────────────────────
 
   OrchestratorFunction:
     Type: AWS::Serverless::Function
@@ -86,106 +32,22 @@ Resources:
       FunctionName: unam-agent-orchestrator
       Handler: index.handler
       CodeUri: ../backend/src/orchestrator/
-      Policies:
-        - DynamoDBCrudPolicy: { TableName: !Ref StudentsTable }
-        - DynamoDBCrudPolicy: { TableName: !Ref CoursesTable }
-        - DynamoDBCrudPolicy: { TableName: !Ref PrerequisitesTable }
-        - DynamoDBCrudPolicy: { TableName: !Ref ProfessorsTable }
-        - DynamoDBCrudPolicy: { TableName: !Ref RoadmapsTable }
-        - DynamoDBCrudPolicy: { TableName: !Ref ProfessorReviewsTable }
-        - DynamoDBCrudPolicy: { TableName: !Ref StudentProgressTable }
-        - DynamoDBCrudPolicy: { TableName: !Ref AgendaTable }
-        - DynamoDBCrudPolicy: { TableName: !Ref RagChunksTable }
-        - DynamoDBCrudPolicy: { TableName: !Ref SessionsTable }
-        - S3ReadPolicy: { BucketName: !Ref RagCorpusBucket }
-        - Statement:
-            - Effect: Allow
-              Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
-              Resource: "*"
-
-  ScraperFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: unam-scraper
-      Handler: index.handler
-      CodeUri: ../backend/src/scraper/
-      Timeout: 300
-      MemorySize: 512
-      Policies:
-        - DynamoDBCrudPolicy: { TableName: !Ref CoursesTable }
-        - DynamoDBCrudPolicy: { TableName: !Ref ProfessorsTable }
-        - DynamoDBCrudPolicy: { TableName: !Ref ProfessorReviewsTable }
-        - S3CrudPolicy: { BucketName: !Ref RagCorpusBucket }
-        - SQSPollerPolicy: { QueueName: !GetAtt ScrapingQueue.QueueName }
+      Role: arn:aws:iam::705315017190:role/nube-agent-execution-role
       Events:
-        SQSTrigger:
-          Type: SQS
+        GetChat:
+          Type: Api
           Properties:
-            Queue: !GetAtt ScrapingQueue.Arn
-            BatchSize: 5
-
-  RefreshSchedulerFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: unam-schedule-refresh
-      Handler: index.handler
-      CodeUri: ../backend/src/refresh/
-      Policies:
-        - SQSSendMessagePolicy: { QueueName: !GetAtt ScrapingQueue.QueueName }
-      Events:
-        NightlyRefresh:
-          Type: Schedule
+            RestApiId: !Ref Api
+            Path: /
+            Method: GET
+        PostChat:
+          Type: Api
           Properties:
-            Schedule: cron(0 2 * * ? *)
-            Description: Nightly refresh of UNAM course schedule data (8pm Mexico City UTC-6)
+            RestApiId: !Ref Api
+            Path: /chat
+            Method: POST
 
-  ReminderFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: unam-reminder-checker
-      Handler: notifications/reminder.handler
-      CodeUri: ../backend/src/orchestrator/
-      Environment:
-        Variables:
-          REMINDERS_TOPIC: !Ref StudentNotificationsTopic
-      Policies:
-        - DynamoDBCrudPolicy: { TableName: !Ref AgendaTable }
-        - SNSPublishMessagePolicy: { TopicName: !GetAtt StudentNotificationsTopic.TopicName }
-      Events:
-        NightlyCheck:
-          Type: Schedule
-          Properties:
-            Schedule: cron(0 2 * * ? *)
-            Name: unam-nightly-reminder
-
-  RagIndexerFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: unam-rag-indexer
-      Handler: rag/indexer.handler
-      CodeUri: ../backend/src/orchestrator/
-      Timeout: 300
-      MemorySize: 1024
-      Policies:
-        - DynamoDBCrudPolicy: { TableName: !Ref RagChunksTable }
-        - S3ReadPolicy: { BucketName: !Ref RagCorpusBucket }
-        - Statement:
-            - Effect: Allow
-              Action: [bedrock:InvokeModel]
-              Resource: "*"
-      Events:
-        S3Upload:
-          Type: S3
-          Properties:
-            Bucket: !Ref RagCorpusBucket
-            Events: s3:ObjectCreated:*
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: prefix
-                    Value: rag/
-
-  # ── API Gateway ────────────────────────────────────────────────────────────
+  # ── API Gateway ───────────────────────────────────────────────────────────────
 
   Api:
     Type: AWS::ApiGateway::RestApi
@@ -248,23 +110,6 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*
 
-  # ── CloudWatch Alarms ──────────────────────────────────────────────────────
-
-  ScrapingDLQAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: unam-scraping-dlq-not-empty
-      MetricName: ApproximateNumberOfMessagesVisible
-      Namespace: AWS/SQS
-      Dimensions:
-        - Name: QueueName
-          Value: !GetAtt ScrapingDLQ.QueueName
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-
   # ── DynamoDB Tables ───────────────────────────────────────────────────────────
 
   StudentsTable:
@@ -272,21 +117,12 @@ Resources:
     Properties:
       TableName: unam-students
       BillingMode: PAY_PER_REQUEST
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
       AttributeDefinitions:
         - { AttributeName: PK, AttributeType: S }
         - { AttributeName: SK, AttributeType: S }
-        - { AttributeName: careerGoal, AttributeType: S }
       KeySchema:
         - { AttributeName: PK, KeyType: HASH }
         - { AttributeName: SK, KeyType: RANGE }
-      GlobalSecondaryIndexes:
-        - IndexName: careerGoal-PK-index
-          KeySchema:
-            - { AttributeName: careerGoal, KeyType: HASH }
-            - { AttributeName: PK, KeyType: RANGE }
-          Projection: { ProjectionType: ALL }
 
   CoursesTable:
     Type: AWS::DynamoDB::Table
@@ -296,22 +132,9 @@ Resources:
       AttributeDefinitions:
         - { AttributeName: PK, AttributeType: S }
         - { AttributeName: SK, AttributeType: S }
-        - { AttributeName: professorId, AttributeType: S }
-        - { AttributeName: semester, AttributeType: S }
       KeySchema:
         - { AttributeName: PK, KeyType: HASH }
         - { AttributeName: SK, KeyType: RANGE }
-      GlobalSecondaryIndexes:
-        - IndexName: professor-courses-index
-          KeySchema:
-            - { AttributeName: professorId, KeyType: HASH }
-            - { AttributeName: SK, KeyType: RANGE }
-          Projection: { ProjectionType: ALL }
-        - IndexName: semester-index
-          KeySchema:
-            - { AttributeName: semester, KeyType: HASH }
-            - { AttributeName: PK, KeyType: RANGE }
-          Projection: { ProjectionType: ALL }
 
   PrerequisitesTable:
     Type: AWS::DynamoDB::Table
@@ -419,17 +242,12 @@ Resources:
         Enabled: true
 
 Outputs:
-  ApiUrl:
+  ChatUrl:
+    Description: Open this URL to chat with your UNAM Student Agent
     Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/prod/"
-  RagBucket:
-    Value: !Ref RagCorpusBucket
-  ScrapingQueue:
-    Value: !Ref ScrapingQueue
-  NotificationsTopic:
-    Value: !Ref StudentNotificationsTopic
   StudentsTable:
     Value: !Ref StudentsTable
   CoursesTable:
     Value: !Ref CoursesTable
-  RoadmapsTable:
-    Value: !Ref RoadmapsTable
+  SessionsTable:
+    Value: !Ref SessionsTable

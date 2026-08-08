@@ -1,85 +1,58 @@
 import { CHAT_HTML } from "./chat-page.mjs";
 import { Agent, BedrockModel, tool } from "@strands-agents/sdk";
 import { z } from "zod";
+import { ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { generateSchedules } from "./schedule.mjs";
 import { calculateProgress } from "./credits.mjs";
-import { checkPrerequisites, getAvailableCourses, calculateCredits, estimateGraduation, suggestTitulacion, rankStudyPriority } from "./solvers/academic.mjs";
-import { getProfile, updateProfile, saveProfessorMemory, updateAcademicProgress, updateCourseGrades } from "./tools/student.mjs";
-import { loadHistory, saveHistory } from "./session.mjs";
-import { ddb } from "./db.mjs";
-import { GetCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
+import {
+  checkPrerequisites, getAvailableCourses,
+  calculateCredits, estimateGraduation,
+  suggestTitulacion, rankStudyPriority,
+} from "./solvers/academic.mjs";
+import {
+  getProfile, updateProfile, saveProfessorMemory,
+  updateAcademicProgress, updateCourseGrades,
+} from "./tools/student.mjs";
+import { loadHistory, saveHistory, loadStudentProgress } from "./session.mjs";
+import { ddb, CATALOG_TABLE } from "./db.mjs";
 
 const model = new BedrockModel({
-  modelId: "global.anthropic.claude-sonnet-5-20251001-v1:0",
+  modelId: "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
 });
 
-// ── DynamoDB helpers ──────────────────────────────────────────────────────────
+// ── Catalog helpers ───────────────────────────────────────────────────────────
 
-async function getStudentProfile(studentId) {
-  const resp = await ddb.send(new GetCommand({
-    TableName: process.env.STUDENTS_TABLE,
-    Key: { PK: `STUDENT#${studentId}`, SK: "PROFILE" },
+async function getCatalogCourseGroups(courseKey, semester) {
+  const resp = await ddb.send(new ScanCommand({
+    TableName: CATALOG_TABLE,
+    FilterExpression: "id = :id",
+    ExpressionAttributeValues: { ":id": `unam#group#${courseKey}#${semester}` },
   }));
-  return resp.Item ?? null;
+  // groups are stored as a list inside a single item
+  const item = resp.Items?.[0];
+  return item?.groups ?? [];
 }
 
-async function getCompletedCourses(studentId) {
-  const resp = await ddb.send(new QueryCommand({
-    TableName: process.env.STUDENTS_TABLE,
-    KeyConditionExpression: "PK = :pk AND begins_with(SK, :prefix)",
-    ExpressionAttributeValues: {
-      ":pk": `STUDENT#${studentId}`,
-      ":prefix": "COURSE#",
-    },
+async function getProfessorFromCatalog(professorId) {
+  const resp = await ddb.send(new ScanCommand({
+    TableName: CATALOG_TABLE,
+    FilterExpression: "id = :id",
+    ExpressionAttributeValues: { ":id": `unam#professor#${professorId}` },
   }));
-  return resp.Items ?? [];
+  return resp.Items?.[0] ?? null;
 }
 
-async function getCourseGroups(courseKey, semester) {
-  const resp = await ddb.send(new QueryCommand({
-    TableName: process.env.COURSES_TABLE,
-    KeyConditionExpression: "PK = :pk AND begins_with(SK, :prefix)",
-    ExpressionAttributeValues: {
-      ":pk": `COURSE#${courseKey}`,
-      ":prefix": `GROUP#${semester}`,
-    },
-  }));
-  return resp.Items ?? [];
-}
-
-async function getProfessor(professorId) {
-  const [profile, reviews] = await Promise.all([
-    ddb.send(new GetCommand({
-      TableName: process.env.PROFESSORS_TABLE,
-      Key: { PK: `PROFESSOR#${professorId}`, SK: "PROFILE" },
-    })),
-    ddb.send(new QueryCommand({
-      TableName: process.env.PROFESSORS_TABLE,
-      KeyConditionExpression: "PK = :pk AND begins_with(SK, :prefix)",
-      ExpressionAttributeValues: {
-        ":pk": `PROFESSOR#${professorId}`,
-        ":prefix": "REVIEWS#",
-      },
-    })),
-  ]);
-  return {
-    profile: profile.Item ?? null,
-    reviews: reviews.Items ?? [],
-  };
-}
-
-// ── Tools ────────────────────────────────────────────────────────────────────
+// ── Tools ─────────────────────────────────────────────────────────────────────
 
 const planSchedule = tool({
   name: "plan_schedule",
   description:
     "Generate ranked, conflict-free schedule options for a student. " +
-    "Requires course keys and semester. Uses deterministic constraint solving — " +
-    "never asks the LLM to check for time overlaps.",
+    "Requires course keys and semester. Never check overlaps yourself.",
   inputSchema: z.object({
-    student_id: z.string().describe("The student's ID"),
-    course_keys: z.array(z.string()).describe("Course identifiers, e.g. ['algoritmos','bases-datos']"),
-    semester: z.string().describe("Semester code, e.g. '2026-1'"),
+    student_id: z.string(),
+    course_keys: z.array(z.string()).describe("e.g. ['1310','1311']"),
+    semester: z.string().describe("e.g. '2026-1'"),
     preferences: z.object({
       morning_preferred: z.boolean().optional(),
       afternoon_preferred: z.boolean().optional(),
@@ -90,29 +63,22 @@ const planSchedule = tool({
   }),
   callback: async ({ student_id, course_keys, semester, preferences = {} }) => {
     const groupsByCourse = await Promise.all(
-      course_keys.map((key) => getCourseGroups(key, semester))
+      course_keys.map(key => getCatalogCourseGroups(key, semester))
     );
-
     const missing = course_keys.filter((_, i) => groupsByCourse[i].length === 0);
     if (missing.length > 0) {
-      return `No groups found in DynamoDB for: ${missing.join(", ")} in ${semester}. ` +
-        "The course data may not have been loaded yet — run the schedule refresh job first.";
+      return `No se encontraron grupos para: ${missing.join(", ")} en ${semester}.`;
     }
-
-    const prefs = {
+    const schedules = generateSchedules(groupsByCourse, {
       morningPreferred: preferences.morning_preferred,
       afternoonPreferred: preferences.afternoon_preferred,
       maxDaysOnCampus: preferences.max_days_on_campus,
       freeDays: preferences.free_days,
       maxGapMinutes: preferences.max_gap_minutes,
-    };
-
-    const schedules = generateSchedules(groupsByCourse, prefs, 5);
+    }, 5);
     if (schedules.length === 0) {
-      return "No valid non-overlapping schedule combination was found for these courses. " +
-        "Consider choosing different groups or removing a constraint.";
+      return "No se encontró ninguna combinación sin traslapes. Intenta con otras materias o menos restricciones.";
     }
-
     return JSON.stringify({ semester, schedules_found: schedules.length, schedules });
   },
 });
@@ -120,21 +86,19 @@ const planSchedule = tool({
 const researchProfessor = tool({
   name: "research_professor",
   description:
-    "Retrieve official profile and cached student reviews for a professor. " +
-    "Source labels distinguish OFFICIAL information from STUDENT_REVIEW content.",
+    "Retrieve official profile and student reviews for a professor from the catalog.",
   inputSchema: z.object({
-    professor_id: z.string().describe("Professor identifier, e.g. 'prof-martinez'"),
+    professor_id: z.string().describe("e.g. 'martinez-gomez-jose'"),
   }),
   callback: async ({ professor_id }) => {
-    const { profile, reviews } = await getProfessor(professor_id);
-    if (!profile) {
-      return `No profile found for professor '${professor_id}'. ` +
-        "The professor data may not have been scraped yet.";
+    const item = await getProfessorFromCatalog(professor_id);
+    if (!item) {
+      return `No se encontró perfil para el profesor '${professor_id}'. Prueba con otro identificador.`;
     }
     return JSON.stringify({
       source_label: "OFFICIAL",
-      profile,
-      reviews: reviews.map((r) => ({ ...r, source_label: "STUDENT_REVIEW" })),
+      profile: item.profile ?? item,
+      reviews: (item.reviews ?? []).map(r => ({ ...r, source_label: "STUDENT_REVIEW" })),
     });
   },
 });
@@ -142,20 +106,20 @@ const researchProfessor = tool({
 const checkAcademicProgress = tool({
   name: "check_academic_progress",
   description:
-    "Calculate a student's current credits, projected credits after the selected " +
-    "semester, and remaining credits toward graduation. Uses deterministic arithmetic.",
+    "Calculate a student's current credits, projected credits, and remaining credits. Never calculate credits yourself.",
   inputSchema: z.object({
-    student_id: z.string().describe("The student's ID"),
+    student_id: z.string(),
     selected_courses: z.array(z.object({
       course_name: z.string(),
       credits: z.number(),
     })).describe("Courses the student plans to take this semester"),
   }),
   callback: async ({ student_id, selected_courses }) => {
-    const completed = await getCompletedCourses(student_id);
+    const courseProgress = await loadStudentProgress(student_id);
+    const completed = Object.values(courseProgress).filter(p => p.estado === "aprobada");
     const result = calculateProgress(
       completed,
-      selected_courses.map((c) => ({ courseName: c.course_name, credits: c.credits })),
+      selected_courses.map(c => ({ courseName: c.course_name, credits: c.credits })),
     );
     return JSON.stringify(result);
   },
@@ -164,12 +128,11 @@ const checkAcademicProgress = tool({
 const getStudentGoals = tool({
   name: "get_student_goals",
   description: "Retrieve a student's profile, interests, and career goals.",
-  inputSchema: z.object({
-    student_id: z.string().describe("The student's ID"),
-  }),
+  inputSchema: z.object({ student_id: z.string() }),
   callback: async ({ student_id }) => {
-    const profile = await getStudentProfile(student_id);
-    if (!profile) return `No profile found for student '${student_id}'.`;
+    const { loadStudentProfile } = await import("./session.mjs");
+    const profile = await loadStudentProfile(student_id);
+    if (!profile) return `No se encontró perfil para estudiante '${student_id}'.`;
     return JSON.stringify(profile);
   },
 });
@@ -177,11 +140,8 @@ const getStudentGoals = tool({
 const checkPrerequisitesTool = tool({
   name: "check_prerequisites",
   description:
-    "Check which courses a student can enroll in based on their academic history. " +
-    "Returns status per course: available, blocked, or available_with_warning.",
-  inputSchema: z.object({
-    student_id: z.string().describe("The student's ID"),
-  }),
+    "Check which courses a student can enroll in based on their academic history. Returns status per course.",
+  inputSchema: z.object({ student_id: z.string() }),
   callback: async ({ student_id }) => {
     const [prereqStatus, available] = await Promise.all([
       checkPrerequisites(student_id),
@@ -193,15 +153,16 @@ const checkPrerequisitesTool = tool({
 
 const estimateGraduationTool = tool({
   name: "estimate_graduation",
-  description: "Estimate graduation semester and suggest titulación modality based on the student's academic profile.",
+  description: "Estimate graduation semester and suggest titulación modality.",
   inputSchema: z.object({
-    student_id: z.string().describe("The student's ID"),
-    credits_per_semester: z.number().optional().describe("Estimated credits per semester (default 30)"),
+    student_id: z.string(),
+    credits_per_semester: z.number().optional(),
   }),
   callback: async ({ student_id, credits_per_semester = 30 }) => {
+    const { loadStudentProfile } = await import("./session.mjs");
     const [creditInfo, profile, graduation] = await Promise.all([
       calculateCredits(student_id),
-      getStudentProfile(student_id),
+      loadStudentProfile(student_id),
       estimateGraduation(student_id, credits_per_semester),
     ]);
     const titulacion = profile ? suggestTitulacion(profile, creditInfo) : [];
@@ -212,7 +173,7 @@ const estimateGraduationTool = tool({
 const rankStudyTool = tool({
   name: "rank_study_priority",
   description:
-    "Rank which courses need the most study attention this week based on current grades, upcoming deadlines, and exam weights.",
+    "Rank which courses need the most study attention this week based on grades, deadlines, and exam weights.",
   inputSchema: z.object({
     materias: z.array(z.object({
       clave: z.string(),
@@ -228,28 +189,28 @@ const rankStudyTool = tool({
   },
 });
 
-// ── System prompt ────────────────────────────────────────────────────────────
+// ── System prompt ─────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You are a personal academic assistant for students at UNAM Facultad de Ciencias (Ciencias de la Computación).
-You help students plan their semester, research professors, track their academic progress, check prerequisites, and build professional roadmaps.
+const SYSTEM_PROMPT = `Eres un asistente académico personal para estudiantes de la UNAM Facultad de Ciencias (Ciencias de la Computación).
+Ayudas a los estudiantes a planear su semestre, investigar profesores, monitorear su avance académico, revisar prerrequisitos y construir roadmaps profesionales.
 
-IMPORTANT RULES:
-1. Never fabricate UNAM course data, professor information, or student reviews.
-2. Always label information by source:
-   - OFFICIAL: from UNAM / Facultad de Ciencias official sources
-   - STUDENT_REVIEW: from misprofes.com or similar student platforms
-   - GENERATED: your own AI recommendations (not fact claims)
-3. Never perform schedule conflict detection yourself — always use the plan_schedule tool.
-4. Never calculate credits yourself — always use the check_academic_progress tool.
-5. Never check prerequisites yourself — always use the check_prerequisites tool.
-6. When you don't have real data (tool returns no results), say so clearly.
-7. Be warm, helpful, and concise. Students are busy.
-8. Respond in Spanish unless the student writes in English.`;
+REGLAS IMPORTANTES:
+1. Nunca inventes datos de materias UNAM, información de profesores o reseñas de estudiantes.
+2. Siempre indica la fuente de información:
+   - OFICIAL: fuentes oficiales de UNAM / Facultad de Ciencias
+   - RESEÑA_ESTUDIANTE: de misprofes.com o plataformas similares
+   - GENERADO: tus propias recomendaciones de IA (no son hechos)
+3. Nunca detectes conflictos de horario tú mismo — siempre usa la herramienta plan_schedule.
+4. Nunca calcules créditos tú mismo — siempre usa check_academic_progress.
+5. Nunca evalúes prerrequisitos tú mismo — siempre usa check_prerequisites.
+6. Si no tienes datos reales (herramienta sin resultados), dilo claramente.
+7. Sé cálido, útil y conciso. Los estudiantes están ocupados.
+8. Responde en español a menos que el estudiante escriba en inglés.
+9. Para identificar al estudiante puedes pedirle su número de cuenta UNAM.`;
 
-// ── Lambda handler ───────────────────────────────────────────────────────────
+// ── Lambda handler ─────────────────────────────────────────────────────────────
 
 export const handler = awslambda.streamifyResponse(async (event, responseStream) => {
-  // GET / → serve the chat UI
   if (event.httpMethod === "GET") {
     responseStream = awslambda.HttpResponseStream.from(responseStream, {
       statusCode: 200,
@@ -293,7 +254,7 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
   for await (const ev of agent.stream(message)) {
     if (
       ev.type === "modelStreamUpdateEvent" &&
-      ev.event.type === "modelContentBlockDeltaEvent" &&
+      ev.event?.type === "modelContentBlockDeltaEvent" &&
       ev.event.delta?.type === "textDelta"
     ) {
       responseStream.write(JSON.stringify({ type: "token", text: ev.event.delta.text }) + "\n");

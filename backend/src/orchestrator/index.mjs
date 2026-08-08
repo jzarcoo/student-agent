@@ -1,43 +1,19 @@
 import { CHAT_HTML } from "./chat-page.mjs";
 import { Agent, BedrockModel, tool } from "@strands-agents/sdk";
-import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import {
-  DynamoDBDocumentClient,
-  GetCommand,
-  PutCommand,
-  QueryCommand,
-} from "@aws-sdk/lib-dynamodb";
 import { z } from "zod";
 import { generateSchedules } from "./schedule.mjs";
 import { calculateProgress } from "./credits.mjs";
-
-const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+import { checkPrerequisites, getAvailableCourses, calculateCredits, estimateGraduation, suggestTitulacion, rankStudyPriority } from "./solvers/academic.mjs";
+import { getProfile, updateProfile, saveProfessorMemory, updateAcademicProgress, updateCourseGrades } from "./tools/student.mjs";
+import { loadHistory, saveHistory } from "./session.mjs";
+import { ddb } from "./db.mjs";
+import { GetCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
 
 const model = new BedrockModel({
-  modelId: "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+  modelId: "global.anthropic.claude-sonnet-5-20251001-v1:0",
 });
 
-// ── Persistence ──────────────────────────────────────────────────────────────
-
-async function loadSession(sessionId) {
-  const resp = await ddb.send(new GetCommand({
-    TableName: process.env.SESSIONS_TABLE,
-    Key: { PK: `SESSION#${sessionId}`, SK: "MESSAGES" },
-  }));
-  return resp.Item ? JSON.parse(resp.Item.messages) : [];
-}
-
-async function saveSession(sessionId, messages) {
-  await ddb.send(new PutCommand({
-    TableName: process.env.SESSIONS_TABLE,
-    Item: {
-      PK: `SESSION#${sessionId}`,
-      SK: "MESSAGES",
-      messages: JSON.stringify(messages),
-      ttl: Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60,
-    },
-  }));
-}
+// ── DynamoDB helpers ──────────────────────────────────────────────────────────
 
 async function getStudentProfile(studentId) {
   const resp = await ddb.send(new GetCommand({
@@ -198,10 +174,64 @@ const getStudentGoals = tool({
   },
 });
 
+const checkPrerequisitesTool = tool({
+  name: "check_prerequisites",
+  description:
+    "Check which courses a student can enroll in based on their academic history. " +
+    "Returns status per course: available, blocked, or available_with_warning.",
+  inputSchema: z.object({
+    student_id: z.string().describe("The student's ID"),
+  }),
+  callback: async ({ student_id }) => {
+    const [prereqStatus, available] = await Promise.all([
+      checkPrerequisites(student_id),
+      getAvailableCourses(student_id),
+    ]);
+    return JSON.stringify({ prereqStatus, availableNow: available });
+  },
+});
+
+const estimateGraduationTool = tool({
+  name: "estimate_graduation",
+  description: "Estimate graduation semester and suggest titulación modality based on the student's academic profile.",
+  inputSchema: z.object({
+    student_id: z.string().describe("The student's ID"),
+    credits_per_semester: z.number().optional().describe("Estimated credits per semester (default 30)"),
+  }),
+  callback: async ({ student_id, credits_per_semester = 30 }) => {
+    const [creditInfo, profile, graduation] = await Promise.all([
+      calculateCredits(student_id),
+      getStudentProfile(student_id),
+      estimateGraduation(student_id, credits_per_semester),
+    ]);
+    const titulacion = profile ? suggestTitulacion(profile, creditInfo) : [];
+    return JSON.stringify({ credits: creditInfo, graduation, titulacionOptions: titulacion });
+  },
+});
+
+const rankStudyTool = tool({
+  name: "rank_study_priority",
+  description:
+    "Rank which courses need the most study attention this week based on current grades, upcoming deadlines, and exam weights.",
+  inputSchema: z.object({
+    materias: z.array(z.object({
+      clave: z.string(),
+      nombre: z.string(),
+      dificultad: z.number().optional(),
+      evaluacion: z.object({ final: z.number().optional() }).optional(),
+    })),
+    calificaciones: z.record(z.object({ promedioParcial: z.number().optional() })).optional(),
+    agenda: z.array(z.object({ clave: z.string(), titulo: z.string(), deadline: z.string() })).optional(),
+  }),
+  callback: async ({ materias, calificaciones = {}, agenda = [] }) => {
+    return JSON.stringify(rankStudyPriority(materias, calificaciones, agenda));
+  },
+});
+
 // ── System prompt ────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You are a personal academic assistant for students at UNAM Facultad de Ciencias.
-You help students plan their semester, research professors, track their academic progress, and build professional roadmaps.
+const SYSTEM_PROMPT = `You are a personal academic assistant for students at UNAM Facultad de Ciencias (Ciencias de la Computación).
+You help students plan their semester, research professors, track their academic progress, check prerequisites, and build professional roadmaps.
 
 IMPORTANT RULES:
 1. Never fabricate UNAM course data, professor information, or student reviews.
@@ -211,8 +241,10 @@ IMPORTANT RULES:
    - GENERATED: your own AI recommendations (not fact claims)
 3. Never perform schedule conflict detection yourself — always use the plan_schedule tool.
 4. Never calculate credits yourself — always use the check_academic_progress tool.
-5. When you don't have real data (tool returns no results), say so clearly.
-6. Be warm, helpful, and concise. Students are busy.`;
+5. Never check prerequisites yourself — always use the check_prerequisites tool.
+6. When you don't have real data (tool returns no results), say so clearly.
+7. Be warm, helpful, and concise. Students are busy.
+8. Respond in Spanish unless the student writes in English.`;
 
 // ── Lambda handler ───────────────────────────────────────────────────────────
 
@@ -232,13 +264,26 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
   const message = body.message ?? "";
   const sessionId = body.sessionId ?? "default";
 
-  const history = await loadSession(sessionId);
+  const history = await loadHistory(sessionId);
 
   const agent = new Agent({
     model,
     systemPrompt: SYSTEM_PROMPT,
     messages: history,
-    tools: [planSchedule, researchProfessor, checkAcademicProgress, getStudentGoals],
+    tools: [
+      planSchedule,
+      researchProfessor,
+      checkAcademicProgress,
+      getStudentGoals,
+      checkPrerequisitesTool,
+      estimateGraduationTool,
+      rankStudyTool,
+      getProfile,
+      updateProfile,
+      saveProfessorMemory,
+      updateAcademicProgress,
+      updateCourseGrades,
+    ],
     printer: false,
   });
 
@@ -257,6 +302,6 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
     }
   }
 
-  await saveSession(sessionId, agent.messages);
+  await saveHistory(sessionId, agent.messages);
   responseStream.end();
 });

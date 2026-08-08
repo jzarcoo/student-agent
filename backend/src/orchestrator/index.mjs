@@ -13,8 +13,10 @@ import {
   getProfile, updateProfile, saveProfessorMemory,
   updateAcademicProgress, updateCourseGrades,
 } from "./tools/student.mjs";
-import { loadHistory, saveHistory, loadStudentProgress } from "./session.mjs";
-import { ddb, CATALOG_TABLE } from "./db.mjs";
+import { loadHistory, saveHistory, loadStudentProgress, loadStudentProfile } from "./session.mjs";
+import { searchDocs } from "./rag/search.mjs";
+import { ddb, CATALOG_TABLE, SESSIONS_TABLE } from "./db.mjs";
+import { GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 
 const model = new BedrockModel({
   modelId: "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
@@ -273,6 +275,250 @@ const findLanguageGaps = tool({
   },
 });
 
+const scaffoldAssignment = tool({
+  name: "scaffold_assignment",
+  description:
+    "Generate a structured scaffold for a school assignment: section titles, a checklist, " +
+    "estimated hours, and suggested resources. ONLY generates structure — never writes content, " +
+    "solves problems, or implements code. Use when a student asks how to start or organize a task.",
+  inputSchema: z.object({
+    titulo: z.string().describe("Assignment title"),
+    tipo: z.enum(["ensayo", "demostracion", "programa", "reporte_lab", "ejercicios", "presentacion"])
+      .describe("Assignment type"),
+    materia: z.string().describe("Course name or key"),
+    descripcion: z.string().optional().describe("Brief description of what the assignment asks for"),
+    fecha_entrega: z.string().optional().describe("Due date ISO or natural language"),
+  }),
+  callback: async ({ titulo, tipo, materia, descripcion = "", fecha_entrega }) => {
+    const templates = {
+      ensayo: {
+        secciones: ["Introducción (planteamiento + tesis)", "Marco teórico / antecedentes", "Desarrollo (2-3 argumentos con evidencia)", "Conclusión (responde la tesis)", "Referencias (formato APA/IEEE)"],
+        checklist: ["¿Tesis clara en la introducción?", "¿Cada párrafo tiene idea principal + apoyo?", "¿Citas y referencias completas?", "¿Revisión de ortografía y estilo?", "¿Cumple con extensión solicitada?"],
+        horas: 6,
+      },
+      demostracion: {
+        secciones: ["Enunciado formal del resultado a demostrar", "Definiciones y lemas previos necesarios", "Cuerpo de la demostración (paso a paso justificado)", "Casos especiales o contraejemplos si aplica", "Conclusión QED"],
+        checklist: ["¿Cada paso tiene justificación lógica?", "¿Se usan solo definiciones ya establecidas?", "¿Se consideraron todos los casos?", "¿La notación es consistente?"],
+        horas: 4,
+      },
+      programa: {
+        secciones: ["Especificación del problema (entradas, salidas, restricciones)", "Diseño de alto nivel (diagrama o pseudocódigo)", "Implementación modular (divide en funciones)", "Pruebas unitarias y casos borde", "Documentación mínima (README + comentarios clave)"],
+        checklist: ["¿Compila / corre sin errores?", "¿Pasa los casos de prueba del enunciado?", "¿Maneja casos borde (vacío, negativo, overflow)?", "¿Código legible y sin código muerto?", "¿README con instrucciones de ejecución?"],
+        horas: 8,
+      },
+      reporte_lab: {
+        secciones: ["Objetivos del experimento", "Marco teórico relevante", "Metodología y procedimiento", "Resultados (tablas, gráficas)", "Análisis y discusión", "Conclusiones", "Referencias"],
+        checklist: ["¿Resultados incluyen unidades y errores?", "¿Gráficas tienen ejes etiquetados?", "¿Análisis responde los objetivos?", "¿Conclusiones conectan con la teoría?"],
+        horas: 5,
+      },
+      ejercicios: {
+        secciones: ["Leer todo antes de empezar (detectar patrones)", "Identificar qué concepto prueba cada ejercicio", "Resolver de menor a mayor dificultad", "Verificar con casos simples", "Documentar el razonamiento, no solo la respuesta"],
+        checklist: ["¿Se respondió lo que se pedía (no algo parecido)?", "¿Se muestran pasos intermedios?", "¿Se revisó con un ejemplo concreto?"],
+        horas: 3,
+      },
+      presentacion: {
+        secciones: ["Portada (título, materia, autores, fecha)", "Agenda (qué van a ver)", "Contexto / motivación (1-2 diapositivas)", "Desarrollo del tema (5-8 diapositivas)", "Demo o ejemplo práctico si aplica", "Conclusiones y trabajo futuro", "Preguntas y referencias"],
+        checklist: ["¿Máximo 6 líneas por diapositiva?", "¿Hay hilo conductor entre diapositivas?", "¿Se ensayó en voz alta?", "¿Tiempo dentro del límite?", "¿Preparadas respuestas a preguntas obvias?"],
+        horas: 4,
+      },
+    };
+
+    const tmpl = templates[tipo];
+    return JSON.stringify({
+      titulo,
+      tipo,
+      materia,
+      descripcion: descripcion || "(sin descripción)",
+      fecha_entrega: fecha_entrega || "No especificada",
+      horas_estimadas: tmpl.horas,
+      secciones: tmpl.secciones,
+      checklist_calidad: tmpl.checklist,
+      recursos_sugeridos: [
+        "Notas de clase y diapositivas del profesor",
+        "Bibliografía del programa de la materia",
+        "Google Scholar para papers",
+        "Biblioteca UNAM: https://www.dgb.unam.mx/",
+      ],
+      nota: "Este scaffold es una guía estructural (GENERADO). El contenido lo desarrollas tú.",
+    }, null, 2);
+  },
+});
+
+// ── Agenda tools ──────────────────────────────────────────────────────────────
+
+async function loadAgenda(studentId) {
+  const resp = await ddb.send(new GetCommand({
+    TableName: SESSIONS_TABLE,
+    Key: { sessionId: `student#${studentId}#agenda` },
+  }));
+  if (!resp.Item) return [];
+  const raw = resp.Item.tasks;
+  return typeof raw === "string" ? JSON.parse(raw) : raw ?? [];
+}
+
+async function saveAgenda(studentId, tasks) {
+  await ddb.send(new PutCommand({
+    TableName: SESSIONS_TABLE,
+    Item: {
+      sessionId: `student#${studentId}#agenda`,
+      tasks: JSON.stringify(tasks),
+      updatedAt: new Date().toISOString(),
+    },
+  }));
+}
+
+const addAgendaTask = tool({
+  name: "add_agenda_task",
+  description: "Add a task or deadline to the student's personal agenda.",
+  inputSchema: z.object({
+    studentId: z.string(),
+    titulo: z.string().describe("Task title, e.g. 'Entregar tarea 3 de Algoritmos'"),
+    materia: z.string().optional().describe("Course this task belongs to"),
+    deadline: z.string().describe("Due date or datetime, e.g. '2026-08-15' or '2026-08-15T18:00'"),
+    tipo: z.enum(["tarea", "examen", "proyecto", "laboratorio", "lectura", "otro"]).optional(),
+    notas: z.string().optional(),
+  }),
+  callback: async ({ studentId, titulo, materia, deadline, tipo = "tarea", notas }) => {
+    const tasks = await loadAgenda(studentId);
+    const id = `task-${Date.now()}`;
+    tasks.push({ id, titulo, materia, deadline, tipo, notas, completada: false, creadaEn: new Date().toISOString() });
+    tasks.sort((a, b) => a.deadline.localeCompare(b.deadline));
+    await saveAgenda(studentId, tasks);
+    return `Tarea "${titulo}" agregada con deadline ${deadline}.`;
+  },
+});
+
+const listAgendaTasks = tool({
+  name: "list_agenda_tasks",
+  description: "List all pending tasks and deadlines for a student, sorted by due date.",
+  inputSchema: z.object({
+    studentId: z.string(),
+    solo_pendientes: z.boolean().optional().describe("Only show incomplete tasks (default true)"),
+  }),
+  callback: async ({ studentId, solo_pendientes = true }) => {
+    const tasks = await loadAgenda(studentId);
+    const filtered = solo_pendientes ? tasks.filter(t => !t.completada) : tasks;
+    if (!filtered.length) return "No hay tareas en la agenda.";
+    return JSON.stringify(filtered, null, 2);
+  },
+});
+
+const completeAgendaTask = tool({
+  name: "complete_agenda_task",
+  description: "Mark a task as completed in the student's agenda.",
+  inputSchema: z.object({
+    studentId: z.string(),
+    task_id: z.string().optional().describe("Task ID (from list_agenda_tasks)"),
+    titulo_partial: z.string().optional().describe("Partial title to fuzzy-match if ID unknown"),
+  }),
+  callback: async ({ studentId, task_id, titulo_partial }) => {
+    const tasks = await loadAgenda(studentId);
+    const task = task_id
+      ? tasks.find(t => t.id === task_id)
+      : tasks.find(t => !t.completada && t.titulo.toLowerCase().includes((titulo_partial ?? "").toLowerCase()));
+    if (!task) return "No se encontró la tarea.";
+    task.completada = true;
+    task.completadaEn = new Date().toISOString();
+    await saveAgenda(studentId, tasks);
+    return `Tarea "${task.titulo}" marcada como completada.`;
+  },
+});
+
+// ── Library search ────────────────────────────────────────────────────────────
+
+const searchLibrary = tool({
+  name: "search_library",
+  description:
+    "Search the UNAM digital library catalog for books, articles, and academic resources. " +
+    "Use when a student asks for bibliography, references, or where to find material for a course.",
+  inputSchema: z.object({
+    query: z.string().describe("Search terms, e.g. 'sistemas operativos Tanenbaum' or 'inteligencia artificial Russell'"),
+    tipo: z.enum(["libro", "articulo", "tesis", "todos"]).optional(),
+  }),
+  callback: async ({ query, tipo = "todos" }) => {
+    try {
+      const encoded = encodeURIComponent(query);
+      const url = `https://opac.dgb.unam.mx/F/?func=find-b&request=${encoded}&find_code=WRD&local_base=ALEPH`;
+      const resp = await fetch(url, {
+        headers: { "User-Agent": "UNAM-Student-Agent/1.0 (academic assistant; contact: soporte@ciencias.unam.mx)" },
+        signal: AbortSignal.timeout(8000),
+      });
+
+      if (!resp.ok) {
+        return JSON.stringify({
+          nota: "La biblioteca UNAM no respondió. Intenta directamente en https://www.dgb.unam.mx/",
+          query,
+          recursos_alternativos: [
+            "Google Scholar: https://scholar.google.com/",
+            "JSTOR: https://www.jstor.org/",
+            "arXiv (CS): https://arxiv.org/list/cs/recent",
+            "Biblioteca Digital UNAM: https://bibliotecadigital.unam.mx/",
+          ],
+        });
+      }
+
+      const html = await resp.text();
+      const results = [];
+      const rowRe = /<td[^>]*class="briefcite"[^>]*>([\s\S]*?)<\/td>/gi;
+      let m;
+      while ((m = rowRe.exec(html)) !== null && results.length < 8) {
+        const text = m[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+        if (text.length > 20) results.push(text);
+      }
+
+      if (!results.length) {
+        return JSON.stringify({
+          query,
+          mensaje: "No se encontraron resultados en el catálogo. Prueba términos más simples.",
+          recursos_alternativos: [
+            "Google Scholar: https://scholar.google.com/",
+            "Biblioteca Digital UNAM: https://bibliotecadigital.unam.mx/",
+          ],
+        });
+      }
+
+      return JSON.stringify({
+        fuente: "OFICIAL — Catálogo OPAC DGBUNAM",
+        query,
+        resultados: results,
+        url_busqueda: `https://opac.dgb.unam.mx/F/?func=find-b&request=${encoded}&find_code=WRD&local_base=ALEPH`,
+      });
+    } catch (err) {
+      return JSON.stringify({
+        nota: "No se pudo consultar la biblioteca en este momento.",
+        recursos_alternativos: [
+          "Biblioteca Digital UNAM: https://bibliotecadigital.unam.mx/",
+          "Google Scholar: https://scholar.google.com/",
+          "arXiv CS: https://arxiv.org/list/cs/recent",
+        ],
+      });
+    }
+  },
+});
+
+const askUnamDocs = tool({
+  name: "ask_unam_docs",
+  description:
+    "Search official UNAM documents (reglamentos, plan de estudios, becas, servicios) " +
+    "using semantic similarity. Use when a student asks about regulations, graduation requirements, " +
+    "service social, scholarships, enrollment, ENALLT info, CAAD, or research opportunities. " +
+    "Always cite the source returned.",
+  inputSchema: z.object({
+    pregunta: z.string().describe("The student's question in natural language"),
+  }),
+  callback: async ({ pregunta }) => {
+    const results = await searchDocs(pregunta, 3);
+    if (!results.length) {
+      return "No encontré información relevante en los documentos oficiales UNAM para esta pregunta.";
+    }
+    return JSON.stringify(results.map(r => ({
+      fuente: `OFICIAL — ${r.source}`,
+      texto: r.text,
+      relevancia: r.score,
+    })));
+  },
+});
+
 // ── System prompt ─────────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `Eres un asistente académico personal para estudiantes de la UNAM Facultad de Ciencias (Ciencias de la Computación).
@@ -291,7 +537,11 @@ REGLAS IMPORTANTES:
 7. Sé cálido, útil y conciso. Los estudiantes están ocupados.
 8. Responde en español a menos que el estudiante escriba en inglés.
 9. Para identificar al estudiante puedes pedirle su número de cuenta UNAM.
-10. Cuando el estudiante pregunte sobre cursos de idiomas o ENALLT, primero usa list_languages para mostrar opciones, luego find_language_gaps con sus slots ocupados para ver cuáles caben en su horario.`;
+10. Cuando el estudiante pregunte sobre cursos de idiomas o ENALLT, primero usa list_languages para mostrar opciones, luego find_language_gaps con sus slots ocupados para ver cuáles caben en su horario.
+11. Cuando el estudiante pida ayuda para organizar una tarea, ensayo o proyecto, usa scaffold_assignment para generar la estructura. NUNCA escribas el contenido ni resuelvas el problema — solo la estructura.
+12. Para agregar tareas o deadlines a la agenda del estudiante usa add_agenda_task. Para ver sus pendientes usa list_agenda_tasks. Para marcar completada usa complete_agenda_task.
+13. Cuando el estudiante pida bibliografía, libros o referencias académicas, usa search_library para consultar el catálogo UNAM.
+14. Cuando el estudiante pregunte sobre reglamentos, titulación, servicio social, becas, inscripciones, ENALLT, CAAD o investigación, usa ask_unam_docs primero para obtener información oficial. Cita siempre la fuente.`;
 
 // ── Lambda handler ─────────────────────────────────────────────────────────────
 
@@ -331,6 +581,12 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream)
       updateCourseGrades,
       listLanguages,
       findLanguageGaps,
+      askUnamDocs,
+      scaffoldAssignment,
+      addAgendaTask,
+      listAgendaTasks,
+      completeAgendaTask,
+      searchLibrary,
     ],
     printer: false,
   });

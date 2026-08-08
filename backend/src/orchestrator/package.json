@@ -1,0 +1,11 @@
+{
+  "name": "unam-agent-orchestrator",
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "@strands-agents/sdk": "^0",
+    "@aws-sdk/client-dynamodb": "^3",
+    "@aws-sdk/lib-dynamodb": "^3",
+    "zod": "^3"
+  }
+}

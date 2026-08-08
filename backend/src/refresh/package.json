@@ -1,0 +1,8 @@
+{
+  "name": "unam-schedule-refresh",
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3"
+  }
+}
